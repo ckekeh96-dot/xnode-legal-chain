@@ -213,6 +213,19 @@ def logout(req:Request,response:Response):
   with db() as c:c.execute('DELETE FROM sessions WHERE token_hash=?',(hashlib.sha256(token.encode()).hexdigest(),))
  response.delete_cookie('xnode_session')
  return {'ok':True}
+class PasswordChangeIn(BaseModel):old_password:str;new_password:str=Field(min_length=12,max_length=200)
+@app.post('/api/account/password')
+def change_password(x:PasswordChangeIn,req:Request,u=Depends(current)):
+ with db() as c:
+  r=c.execute('SELECT password FROM users WHERE id=?',(u['id'],)).fetchone()
+  if not r or not check_pw(x.old_password,r['password']):raise HTTPException(401,'Current password is incorrect')
+  c.execute('UPDATE users SET password=? WHERE id=?',(hash_pw(x.new_password),u['id']))
+  token=req.cookies.get('xnode_session') or ''
+  cur=c.execute('DELETE FROM sessions WHERE user_id=? AND token_hash<>?',(u['id'],hashlib.sha256(token.encode()).hexdigest()))
+  c.execute('INSERT INTO security_events VALUES(?,?,?,?)',(uid(),u['id'],'password_changed',int(time.time())))
+  audit(c,u,'account.password_changed','self')
+ return {'ok':True,'revoked_other_sessions':cur.rowcount,
+  'notice':'Password updated. Other sessions for this account have been signed out; this session remains active.'}
 @app.get('/api/me')
 def me(u=Depends(current)):return u
 @app.get('/api/departments')
@@ -484,6 +497,12 @@ def add_note(mid:str,x:NoteIn,u=Depends(current)):
   c.execute('INSERT INTO notes VALUES(?,?,?,?,?,?)',(nid,mid,m['department'],x.body,u['id'],int(time.time())))
   audit(c,u,'note.create',nid)
  return {'id':nid}
+@app.get('/api/notes/recent')
+def recent_notes(u=Depends(current)):
+ with db() as c:
+  if u['department']==CEO:rr=c.execute('SELECT n.*,m.title AS matter_title FROM notes n JOIN matters m ON m.id=n.matter_id ORDER BY n.created_at DESC LIMIT 100')
+  else:rr=c.execute('SELECT n.*,m.title AS matter_title FROM notes n JOIN matters m ON m.id=n.matter_id WHERE n.department=? ORDER BY n.created_at DESC LIMIT 100',(u['department'],))
+  return [dict(r) for r in rr]
 @app.get('/api/templates')
 def list_templates(u=Depends(current)):
  return [{'id':'consultation_summary','name':'Consultation summary'},
@@ -505,6 +524,42 @@ def generate_draft(x:DraftIn,u=Depends(current)):
  else:
   body=f"MATTER CHECKLIST — DRAFT\\n{mid}: {title}\\n[ ] Conflict check\\n[ ] FICA/KYC review\\n[ ] Signed engagement\\n[ ] Confirm limitation and filing dates\\n[ ] Evidence and instructions verified\\n[ ] Supervising attorney approval\\n"
  return {'notice':'Offline template only; no AI model or legal analysis is connected. Attorney review required.','body':body}
+@app.get('/api/drafts/usage')
+def drafts_usage(u=Depends(current)):
+ with db() as c:
+  if u['department']==CEO:rr=c.execute("SELECT actor,resource,ts FROM audit WHERE action='draft.generate' ORDER BY ts DESC LIMIT 100")
+  else:rr=c.execute("SELECT actor,resource,ts FROM audit WHERE action='draft.generate' AND actor=? ORDER BY ts DESC LIMIT 100",(u['id'],))
+  entries=[dict(r) for r in rr]
+ by_user={};by_matter={}
+ for e in entries:
+  by_user[e['actor']]=by_user.get(e['actor'],0)+1
+  by_matter[e['resource']]=by_matter.get(e['resource'],0)+1
+ return {'total':len(entries),'by_user':by_user,'by_matter':by_matter,'last_used':max((e['ts'] for e in entries),default=None),'entries':entries}
+
+# v24.1 clause review: deterministic local keyword checks; no AI, no legal advice.
+class ClauseReviewIn(BaseModel):matter_id:str;document_text:str=Field(min_length=1,max_length=100000)
+ESSENTIAL_CLAUSES=[('Governing law & jurisdiction',['governing law','jurisdiction','laws of the republic','south african law']),('Termination rights',['termination','terminate']),('Confidentiality',['confidential','non-disclosure']),('Dispute resolution',['dispute resolution','arbitration','mediation']),('Payment terms',['payment','fees','invoice','consideration']),('Data protection (POPIA)',['popia','personal information','data protection','privacy']),('Force majeure',['force majeure','act of god']),('Signature block',['signature','signed by','signatories']),('Entire agreement',['entire agreement','whole agreement','supersedes'])]
+RISKY_LANGUAGE=[('Unlimited liability',['unlimited liability','liability is unlimited','uncapped','without limitation'],'High'),('Unilateral amendment',['sole discretion','unilaterally','may amend'],'High'),('Automatic renewal',['automatically renew','auto-renew','automatic renewal','evergreen'],'Medium'),('Indefinite term',['in perpetuity','indefinitely','perpetual'],'Medium'),('Penalty provisions',['penalty','liquidated damages'],'Medium'),('Vague deadlines',['reasonable time','as soon as possible','asap','forthwith'],'Low'),('Restraint of trade',['non-compete','non compete','restraint of trade'],'Low')]
+@app.post('/api/review/clauses')
+def review_clauses(x:ClauseReviewIn,u=Depends(current)):
+ with db() as c:
+  m=c.execute('SELECT * FROM matters WHERE id=?',(x.matter_id,)).fetchone()
+  if not m:raise HTTPException(404)
+  scope(u,m['department'])
+  audit(c,u,'review.clauses',m['id'])
+ text=x.document_text.lower();flags=[]
+ for name,kws in ESSENTIAL_CLAUSES:
+  hit=next((k for k in kws if k in text),None)
+  flags.append({'check':name,'category':'Essential clause','severity':'Medium','status':'OK' if hit else 'Missing','evidence':hit or ''})
+ for name,kws,sev in RISKY_LANGUAGE:
+  hits=[k for k in kws if k in text]
+  flags.append({'check':name,'category':'Risky language','severity':sev,'status':'Review' if hits else 'OK','evidence':', '.join(hits[:3])})
+ placeholders=[k for k in ('[]','__','tbd','tbc','xxx') if k in text]
+ if placeholders:flags.append({'check':'Unfilled placeholders','category':'Drafting hygiene','severity':'High','status':'Review','evidence':', '.join(placeholders)})
+ flagged=[f for f in flags if f['status']!='OK']
+ risk='High' if any(f['status']!='OK' and f['severity']=='High' for f in flags) else ('Medium' if any(f['status']!='OK' and f['severity']=='Medium' for f in flags) else ('Low' if flagged else 'Clean'))
+ return {'notice':'Local keyword checks only — not AI or legal advice. Every flag requires review by a qualified attorney.','flags':flags,
+  'summary':{'checks_run':len(flags),'flagged':len(flagged),'high':sum(1 for f in flags if f['status']!='OK' and f['severity']=='High'),'risk':risk,'words':len(x.document_text.split()),'chars':len(x.document_text)}}
 
 # v5: departmental workflow checklists and internal department message board
 WORKFLOWS={
@@ -612,6 +667,17 @@ def ai_assist(x:AIRequest,u=Depends(current)):
  with db() as c:audit(c,u,'ai.local_assist',x.matter_id)
  return {'draft':result[:16000],'model':model,
          'notice':'Unverified AI-generated draft. Qualified attorney must verify all claims, citations and deadlines.'}
+@app.get('/api/ai/usage')
+def ai_usage(u=Depends(current)):
+ with db() as c:
+  if u['department']==CEO:rr=c.execute("SELECT actor,resource,ts FROM audit WHERE action='ai.local_assist' ORDER BY ts DESC LIMIT 100")
+  else:rr=c.execute("SELECT actor,resource,ts FROM audit WHERE action='ai.local_assist' AND actor=? ORDER BY ts DESC LIMIT 100",(u['id'],))
+  entries=[dict(r) for r in rr]
+ by_user={};by_matter={}
+ for e in entries:
+  by_user[e['actor']]=by_user.get(e['actor'],0)+1
+  by_matter[e['resource']]=by_matter.get(e['resource'],0)+1
+ return {'total':len(entries),'by_user':by_user,'by_matter':by_matter,'last_used':max((e['ts'] for e in entries),default=None),'entries':entries}
 
 @app.get('/api/security/activity')
 def security_activity(u=Depends(current)):
@@ -854,6 +920,17 @@ def revoke_invite(iid:str,u=Depends(current)):
   c.execute('UPDATE client_invites SET revoked_at=? WHERE id=?',(int(time.time()),iid))
   audit(c,u,'agreement.client_invite_revoked',iid)
  return {'revoked':True}
+@app.get('/api/client-invites')
+def list_client_invites(u=Depends(current)):
+ with db() as c:
+  now=int(time.time())
+  if u['department']==CEO:rr=c.execute('SELECT i.*,a.title AS agreement_title,cr.decision AS decision FROM client_invites i JOIN agreements a ON a.id=i.agreement_id LEFT JOIN client_reviews cr ON cr.invite_id=i.id ORDER BY i.created_at DESC LIMIT 100')
+  else:rr=c.execute('SELECT i.*,a.title AS agreement_title,cr.decision AS decision FROM client_invites i JOIN agreements a ON a.id=i.agreement_id LEFT JOIN client_reviews cr ON cr.invite_id=i.id WHERE a.department=? ORDER BY i.created_at DESC LIMIT 100',(u['department'],))
+  reviews={v['decision']:v['n'] for v in c.execute('SELECT decision,COUNT(*) n FROM client_reviews GROUP BY decision')}
+  invites=[dict(r) for r in rr]
+ for r in invites:
+  r['status']='Revoked' if r['revoked_at'] else ('Consumed' if r['consumed_at'] else ('Expired' if r['expires_at']<=now else 'Active'))
+ return {'invites':invites,'reviews':reviews,'total':len(invites),'active':sum(1 for r in invites if r['status']=='Active')}
 
 # v15: deterministic evidence bundle and unsigned testnet anchoring payload.
 # No wallet, external RPC, identity proof or signature is performed.
