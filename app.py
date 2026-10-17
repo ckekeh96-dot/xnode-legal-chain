@@ -266,7 +266,14 @@ def update_task(tid:str,x:TaskStatus,u=Depends(current)):
 def documents(u=Depends(current)):
  with db() as c:
   rr=c.execute('SELECT * FROM documents').fetchall()
-  return [dict(r) for r in rr if doc_access(c,u,r)]
+  out=[]
+  for r in rr:
+   if doc_access(c,u,r):
+    d=dict(r)
+    f=STORE/r['id']
+    d['size']=f.stat().st_size if f.exists() else 0
+    out.append(d)
+  return out
 @app.post('/api/documents/{matter_id}')
 async def upload(matter_id:str,file:UploadFile=File(...),u=Depends(current)):
  with db() as c:
@@ -520,6 +527,12 @@ class MessageIn(BaseModel):
 @app.get('/api/workflow-templates')
 def workflow_templates(u=Depends(current)):
  return {d:stages for d,stages in WORKFLOWS.items() if u['department']==CEO or d==u['department']}
+@app.get('/api/workflow-board')
+def workflow_board(u=Depends(current)):
+ with db() as c:
+  if u['department']==CEO:rr=c.execute('SELECT w.*,m.title AS matter_title,m.client AS matter_client FROM workflow_items w JOIN matters m ON m.id=w.matter_id')
+  else:rr=c.execute('SELECT w.*,m.title AS matter_title,m.client AS matter_client FROM workflow_items w JOIN matters m ON m.id=w.matter_id WHERE w.department=?',(u['department'],))
+  return [dict(r) for r in rr]
 @app.get('/api/workflows/{mid}')
 def workflows(mid:str,u=Depends(current)):
  with db() as c:

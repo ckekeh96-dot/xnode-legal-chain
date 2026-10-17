@@ -1,5 +1,6 @@
 from fastapi.testclient import TestClient
 import hashlib
+import secrets
 import app as mod
 def auth(name):
  c=TestClient(mod.app)
@@ -18,7 +19,7 @@ def test_intent_submission_reconciliation(monkeypatch):
  path=f'/api/blockchain/tx-intents/{intent}'
  ceo.post(path+'/approve',json={'confirmation':'I AUTHORIZE PREPARATION FOR BASE SEPOLIA TESTNET'})
  request=ceo.get(path+'/unsigned-request').json()['request']
- txhash='0x'+'a'*64
+ txhash='0x'+secrets.token_hex(32)
  assert staff.post(path+'/submitted',json={'transaction_hash':txhash}).status_code==403
  assert ceo.post(path+'/submitted',json={'transaction_hash':txhash}).status_code==200
  assert ceo.post(path+'/submitted',json={'transaction_hash':txhash}).status_code==200
